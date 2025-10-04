@@ -1,0 +1,12 @@
+# config/settings.yaml
+
+# … existing entries …
+
+services:
+  gemini:
+    url: "https://api.example.com/v1/gemini/generate"   # replace with real Gemini endpoint
+    key: "YOUR_GEMINI_API_KEY"
+    model: "gemini-small"
+  elevenlabs:
+    url: "https://api.elevenlabs.io/v1/text-to-speech/Alloy"  # Alloy voice
+    key: "YOUR_ELEVENLABS_API_KEY"
