@@ -47,6 +47,10 @@ def on_frame(data):
     metrics, overlays, cue = trackers[mode].update(kps)
     socketio.emit("metrics", MetricsOut.ok(metrics, overlays, cue), json=True)
 
+@socketio.on("frame_ping")
+def frame_ping(_):
+    emit("pong", {"ok": True})
+
 @socketio.on("finish_session")
 def finish_session(data):
     report = session_store.finish()

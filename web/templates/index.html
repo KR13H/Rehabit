@@ -1,0 +1,45 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Rehabit camera test</title>
+  <style> video, canvas { width: 480px; height: 360px; border-radius: 8px; } </style>
+</head>
+<body>
+  <h3>Rehabit camera test</h3>
+  <p id="status">Loading…</p>
+  <video id="v" autoplay playsinline muted></video>
+  <canvas id="c"></canvas>
+
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+  <script>
+    const v=document.getElementById('v'), c=document.getElementById('c'), ctx=c.getContext('2d');
+    const status=document.getElementById('status'); c.width=480; c.height=360;
+
+    const socket = io(); // connects to same-origin Flask-SocketIO
+    socket.on("connect", ()=>{ status.textContent="Socket.IO connected ✅"; });
+    socket.on("metrics",  (m)=>{ status.textContent="Got metrics: " + JSON.stringify(m).slice(0,80) + "…"; });
+    socket.on("pong",     ()=>{ /* optional */ });
+
+    // Ask for camera and start sending frames
+    navigator.mediaDevices.getUserMedia({video:true}).then(stream=>{
+      v.srcObject=stream; status.textContent="Camera OK ✅";
+      function tick(){
+        ctx.drawImage(v,0,0,c.width,c.height);
+        c.toBlob(b=>{
+          const r=new FileReader();
+          r.onloadend=()=>{
+            socket.emit("frame", {img_b64:r.result, mode:"arms"});   // your server's handler
+            socket.emit("frame_ping", {});                            // quick echo
+          };
+          r.readAsDataURL(b);
+        }, 'image/jpeg', 0.5);
+        setTimeout(tick, 100); // ~10 fps
+      }
+      tick();
+    }).catch(err=>{
+      status.textContent="Camera error: " + err.message + " ❌";
+    });
+  </script>
+</body>
+</html>
