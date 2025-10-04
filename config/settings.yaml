@@ -1,0 +1,16 @@
+model:
+  mediapipe:
+    detection_conf: 0.5
+    tracking_conf: 0.5
+smoothing:
+  enabled: true
+  type: "ema"          # or "one_euro"
+  ema_alpha: 0.25
+confidence:
+  min_visibility: 0.5
+metrics:
+  asymmetry_warn: 0.25
+  trunk_lean_warn_deg: 30
+server:
+  host: "0.0.0.0"
+  port: 5000

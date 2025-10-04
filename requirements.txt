@@ -1,0 +1,9 @@
+flask
+flask-socketio
+python-engineio<4
+python-socketio<6
+opencv-python
+mediapipe
+numpy
+pydantic
+pyyaml
