@@ -1,0 +1,16 @@
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+# Python build/cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+.dist/
+build/
+# OS/editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
