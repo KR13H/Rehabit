@@ -1,4 +1,6 @@
 # app.py
+import requests
+import base64
 
 from flask import Flask, render_template
 from flask_socketio import SocketIO, emit
@@ -29,11 +31,52 @@ session_store = SessionStore()
 def index():
     return render_template("index.html")
 
-@socketio.on("start_task")
-def start_task(data):
+@socketio.on("frame")
+def on_frame(data):
     mode = data.get("mode", "arms")
-    trackers[mode].reset()
-    emit("task_started", {"ok": True, "mode": mode})
+    img_b64 = data["img_b64"].split(",")[1]
+    img = base64.b64decode(img_b64)
+    frame = cv2.imdecode(np.frombuffer(img, np.uint8), cv2.IMREAD_COLOR)
+
+    kps = pose_engine.infer(frame)
+    if not valid_keypoints(kps, cfg):
+        emit("metrics", MetricsOut.paused("Recenter your body"), json=True)
+        return
+
+    metrics, overlays, cue = trackers[mode].update(kps)
+
+    if cue:
+        # Gemini API call
+        gem_cfg = cfg["services"]["gemini"]
+        gem_payload = {
+            "model": gem_cfg["model"],
+            "prompt": f"The patient has this issue: {cue} The asymmetry index is {metrics.get('asymmetry_index', 0):.2f}. Provide one simple corrective tip."
+        }
+        gem_headers = {"Authorization": f"Bearer {gem_cfg['key']}"}
+        gem_resp = requests.post(gem_cfg["url"], json=gem_payload, headers=gem_headers)
+        tip_text = gem_resp.json().get("choices", [{}])[0].get("text", cue)
+
+        # ElevenLabs TTS call
+        eleven_cfg = cfg["services"]["elevenlabs"]
+        tts_payload = {"text": tip_text}
+        tts_headers = {
+            "xi-api-key": eleven_cfg["key"],
+            "Content-Type": "application/json"
+        }
+        tts_resp = requests.post(eleven_cfg["url"], json=tts_payload, headers=tts_headers)
+        if tts_resp.status_code == 200:
+            audio_b64 = base64.b64encode(tts_resp.content).decode()
+        else:
+            audio_b64 = ""
+
+        # Send updates
+        emit("metrics", MetricsOut.ok(metrics, overlays, cue=tip_text), json=True)
+        if audio_b64:
+            socketio.emit("audio_cue", {"audio": audio_b64})
+
+    else:
+        emit("metrics", MetricsOut.ok(metrics, overlays), json=True)
+
 
 @socketio.on("frame")
 def on_frame(data):
