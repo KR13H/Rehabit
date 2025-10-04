@@ -1,45 +1,200 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8"/>
-  <title>Rehabit camera test</title>
-  <style> video, canvas { width: 480px; height: 360px; border-radius: 8px; } </style>
+  <title>Rehabit — camera test</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:#0b0d12; color:#e8ecf1; }
+    header { padding: 16px 20px; border-bottom: 1px solid #1b2230; display:flex; align-items:center; gap:12px;}
+    h1 { font-size: 18px; margin:0; font-weight:600; letter-spacing:.3px; }
+    .badge { font-size:12px; padding:4px 8px; border:1px solid #2a354a; border-radius:999px; color:#b9c7da; }
+    main { display:grid; grid-template-columns: 520px 1fr; gap:18px; padding:18px 20px; }
+    .panel { background:#0f1420; border:1px solid #1b2230; border-radius:14px; padding:14px; }
+    .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+    button { background:#1b2436; color:#dfe7f5; border:1px solid #2a354a; padding:10px 14px; border-radius:10px; cursor:pointer; }
+    button.active { outline:2px solid #4da3ff; }
+    button:disabled { opacity:.6; cursor:not-allowed; }
+    #status { font-size: 13px; color:#9fb1c9; }
+    #view { position: relative; width: 480px; height: 360px; border-radius: 12px; overflow: hidden; border:1px solid #21304a; }
+    #v, #c { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+    pre { margin:0; white-space:pre-wrap; font-size:13px; line-height:1.35; color:#cfe0ff; }
+    .cue { color:#9af59a; font-weight:600; }
+  </style>
 </head>
 <body>
-  <h3>Rehabit camera test</h3>
-  <p id="status">Loading…</p>
-  <video id="v" autoplay playsinline muted></video>
-  <canvas id="c"></canvas>
+  <header>
+    <h1>Rehabit</h1>
+    <span class="badge">Pose tracking test</span>
+    <div id="status" style="margin-left:auto;">Initializing…</div>
+  </header>
+
+  <main>
+    <section class="panel">
+      <div class="row" style="margin-bottom:10px;">
+        <button id="btn-arms"  class="active" data-mode="arms">Arms</button>
+        <button id="btn-sit"   data-mode="sit">Sit ↔ Stand</button>
+        <button id="btn-march" data-mode="march">March</button>
+        <button id="btn-ping"  style="margin-left:auto;">Ping</button>
+      </div>
+      <div id="view">
+        <video id="v" autoplay playsinline muted></video>
+        <canvas id="c"></canvas>
+      </div>
+      <div class="row" style="margin-top:10px; font-size:13px; color:#97a9c3;">
+        <div>FPS: <span id="fps">0</span></div>
+        <div style="margin-left:12px;">Mode: <span id="mode-label">arms</span></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h3 style="margin:0 0 8px 0; font-size:16px;">Metrics</h3>
+      <pre id="metrics">Waiting for data…</pre>
+      <div id="cue" class="cue" style="margin-top:10px;"></div>
+    </section>
+  </main>
 
   <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
   <script>
-    const v=document.getElementById('v'), c=document.getElementById('c'), ctx=c.getContext('2d');
-    const status=document.getElementById('status'); c.width=480; c.height=360;
+    const v = document.getElementById('v');
+    const c = document.getElementById('c');
+    const ctx = c.getContext('2d');
+    const statusEl = document.getElementById('status');
+    const fpsEl = document.getElementById('fps');
+    const metricsEl = document.getElementById('metrics');
+    const cueEl = document.getElementById('cue');
+    const modeLabel = document.getElementById('mode-label');
 
-    const socket = io(); // connects to same-origin Flask-SocketIO
-    socket.on("connect", ()=>{ status.textContent="Socket.IO connected ✅"; });
-    socket.on("metrics",  (m)=>{ status.textContent="Got metrics: " + JSON.stringify(m).slice(0,80) + "…"; });
-    socket.on("pong",     ()=>{ /* optional */ });
+    const buttons = {
+      arms:  document.getElementById('btn-arms'),
+      sit:   document.getElementById('btn-sit'),
+      march: document.getElementById('btn-march'),
+      ping:  document.getElementById('btn-ping'),
+    };
 
-    // Ask for camera and start sending frames
-    navigator.mediaDevices.getUserMedia({video:true}).then(stream=>{
-      v.srcObject=stream; status.textContent="Camera OK ✅";
-      function tick(){
-        ctx.drawImage(v,0,0,c.width,c.height);
-        c.toBlob(b=>{
-          const r=new FileReader();
-          r.onloadend=()=>{
-            socket.emit("frame", {img_b64:r.result, mode:"arms"});   // your server's handler
-            socket.emit("frame_ping", {});                            // quick echo
-          };
-          r.readAsDataURL(b);
-        }, 'image/jpeg', 0.5);
-        setTimeout(tick, 100); // ~10 fps
+    const socket = io(); // same-origin
+    let mode = 'arms';
+    let lastCue = '';
+    let lastFrameTime = performance.now();
+    let frameIntervalMs = 100; // ~10 fps
+    let sending = false;
+    let lastSkeleton = null; // {kp:[{x,y,v,name}], lines:[[n1,n2], ...]}
+
+    function setMode(m) {
+      mode = m; modeLabel.textContent = m;
+      for (const k of ['arms','sit','march']) buttons[k].classList.toggle('active', k===m);
+      socket.emit('start_task', {mode:m});
+    }
+
+    function speak(text) {
+      if (!window.speechSynthesis) return;
+      if (!text || text === lastCue) return;
+      const u = new SpeechSynthesisUtterance(text);
+      u.rate = 1.1;
+      window.speechSynthesis.cancel();
+      window.speechSynthesis.speak(u);
+      lastCue = text;
+    }
+
+    buttons.arms.onclick  = ()=> setMode('arms');
+    buttons.sit.onclick   = ()=> setMode('sit');
+    buttons.march.onclick = ()=> setMode('march');
+    buttons.ping.onclick  = ()=> socket.emit('frame_ping', {});
+
+    socket.on('connect',   ()=> statusEl.textContent = 'Socket.IO connected ✅');
+    socket.on('disconnect',()=> statusEl.textContent = 'Disconnected ❌');
+    socket.on('task_started', ({ok, mode})=>{ if (ok) statusEl.textContent = `Task started: ${mode}`; });
+    socket.on('pong', ()=> { statusEl.textContent = 'Ping OK ✅'; });
+
+    socket.on('metrics', (payload)=>{
+      fpsEl.textContent = computeFps().toFixed(0);
+      if (!payload){ return; }
+
+      if (payload.status === 'paused') {
+        metricsEl.textContent = (payload.metrics && payload.metrics.message) ? `Paused: ${payload.metrics.message}` : 'Paused';
+        cueEl.textContent = '';
+        lastSkeleton = null;
+        return;
       }
-      tick();
-    }).catch(err=>{
-      status.textContent="Camera error: " + err.message + " ❌";
+      metricsEl.textContent = JSON.stringify(payload.metrics || {}, null, 2);
+      if (payload.cue) { cueEl.textContent = payload.cue; speak(payload.cue); } else { cueEl.textContent = ''; }
+
+      if (payload.overlays && payload.overlays.skeleton) {
+        lastSkeleton = payload.overlays.skeleton;
+      }
     });
+
+    async function startCamera() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({video:true});
+        v.srcObject = stream; await v.play();
+        c.width = 480; c.height = 360;
+        sending = true; loop();
+        statusEl.textContent = 'Camera OK ✅';
+      } catch (err) {
+        statusEl.textContent = `Camera error: ${err.message}`;
+      }
+    }
+
+    function drawSkeleton(ctx, skel) {
+      if (!skel || !skel.kp || !skel.lines) return;
+      // map by name for quick lookup
+      const P = {}; for (const p of skel.kp) { P[p.name] = p; }
+
+      ctx.save();
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = 'white';
+      ctx.globalAlpha = 0.9;
+
+      for (const [a,b] of skel.lines) {
+        if (!P[a] || !P[b]) continue;
+        if (P[a].v < 0.4 || P[b].v < 0.4) continue;
+        ctx.beginPath();
+        ctx.moveTo(P[a].x * (c.width/480), P[a].y * (c.height/360)); // scaling guard if sizes differ
+        ctx.lineTo(P[b].x * (c.width/480), P[b].y * (c.height/360));
+        ctx.stroke();
+      }
+
+      ctx.fillStyle = 'deepskyblue';
+      for (const p of skel.kp) {
+        if (p.v < 0.4) continue;
+        ctx.beginPath();
+        ctx.arc(p.x * (c.width/480), p.y * (c.height/360), 4, 0, Math.PI*2);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    function loop() {
+      if (!sending) return;
+      const now = performance.now();
+      if (now - lastFrameTime >= frameIntervalMs) {
+        lastFrameTime = now;
+        ctx.drawImage(v, 0, 0, c.width, c.height);
+        // draw latest skeleton overlay (from previous frames) on top
+        if (lastSkeleton) drawSkeleton(ctx, lastSkeleton);
+
+        c.toBlob((blob)=>{
+          if (!blob) return;
+          const r = new FileReader();
+          r.onloadend = ()=> socket.emit('frame', { img_b64: r.result, mode });
+          r.readAsDataURL(blob);
+        }, 'image/jpeg', 0.6);
+      }
+      requestAnimationFrame(loop);
+    }
+
+    let _fpsLast = performance.now(), _frames = 0, _fps = 0;
+    function computeFps(){
+      _frames++;
+      const t = performance.now();
+      if (t - _fpsLast > 500){ _fps = (_frames * 1000) / (t - _fpsLast); _fpsLast = t; _frames = 0; }
+      return _fps;
+    }
+
+    setMode('arms');
+    startCamera();
   </script>
 </body>
 </html>
