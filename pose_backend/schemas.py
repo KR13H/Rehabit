@@ -1,9 +1,10 @@
+# pose_backend/schemas.py
 from pydantic import BaseModel
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
-class FrameIn(BaseModel):
-    img_b64: str
-    mode: str
+def _to_dict(model: BaseModel) -> Dict[str, Any]:
+    # Works on both Pydantic v2 (model_dump) and v1 (dict)
+    return model.model_dump() if hasattr(model, "model_dump") else model.dict()
 
 class MetricsOut(BaseModel):
     status: str
@@ -13,7 +14,8 @@ class MetricsOut(BaseModel):
 
     @staticmethod
     def ok(metrics, overlays, cue=None):
-        return MetricsOut(status="ok", metrics=metrics, overlays=overlays, cue=cue).model_dump()
+        return _to_dict(MetricsOut(status="ok", metrics=metrics, overlays=overlays, cue=cue))
+
     @staticmethod
     def paused(msg):
-        return MetricsOut(status="paused", metrics={"message": msg}).model_dump()
+        return _to_dict(MetricsOut(status="paused", metrics={"message": msg}))
