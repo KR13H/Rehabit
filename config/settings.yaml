@@ -1,11 +1,10 @@
-<<<<<<< HEAD
 model:
   mediapipe:
     detection_conf: 0.5
     tracking_conf: 0.5
 smoothing:
   enabled: true
-  type: "ema"          # or "one_euro"
+  type: "ema"
   ema_alpha: 0.25
 confidence:
   min_visibility: 0.5
@@ -15,17 +14,12 @@ metrics:
 server:
   host: "0.0.0.0"
   port: 5000
-=======
-# config/settings.yaml
-
-# … existing entries …
 
 services:
   gemini:
-    url: "https://api.example.com/v1/gemini/generate"   # replace with real Gemini endpoint
-    key: "YOUR_GEMINI_API_KEY"
+    url: GEMINI_API_URL
+    key: GEMINI_API_KEY
     model: "gemini-small"
   elevenlabs:
-    url: "https://api.elevenlabs.io/v1/text-to-speech/Alloy"  # Alloy voice
-    key: "YOUR_ELEVENLABS_API_KEY"
->>>>>>> feature/gemini-elevenlabs-audio
+    url: ELEVENLABS_API_URL
+    key: ELEVENLABS_API_KEY

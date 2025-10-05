@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 import os, base64, time, math, traceback, requests
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,6 +38,14 @@ app = Flask(
 )
 app.config["SECRET_KEY"] = os.getenv("SECRET_KEY") or os.urandom(24).hex()
 socketio = SocketIO(app, cors_allowed_origins="*")
+
+def resolve_env_vars(config_services):
+    for service in config_services.values():
+        for field in ["key", "url"]:
+            if field in service and service[field].isupper():
+                # Looks up variable from .env/environment
+                service[field] = os.getenv(service[field], "")
+resolve_env_vars(cfg["services"])
 
 # ------------ Engines/Trackers -------------
 pose_engine = PoseEngine(cfg)
