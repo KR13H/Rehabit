@@ -12,6 +12,7 @@ from flask_socketio import SocketIO, emit
 
 
 # ---- local modules you already have ----
+# local imports
 from pose_backend.mediapipe_engine import PoseEngine
 from pose_backend.schemas import MetricsOut
 from pose_backend.utils import valid_keypoints
@@ -19,6 +20,10 @@ from trackers.arms import ArmsTracker
 from trackers.sit_to_stand import SitStandTracker
 from trackers.march import MarchTracker
 from services.session_store import SessionStore
+
+# Setup logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 # --------------------- Paths & Config ---------------------
 ROOT = Path(__file__).parent.resolve()
@@ -499,14 +504,17 @@ def on_frame(data):
         img = base64.b64decode(img_b64)
         frame = cv2.imdecode(np.frombuffer(img, np.uint8), cv2.IMREAD_COLOR)
         if frame is None:
-            emit("metrics", MetricsOut.paused("Bad image payload"), json=True); return
+            emit("metrics", MetricsOut.paused("Bad image payload"), json=True)
+            return
 
         kps = pose_engine.infer(frame)  # dict: {name: (x,y,z,v)}
         if not kps or not valid_keypoints(kps, cfg):
-            emit("metrics", MetricsOut.paused("Recenter your body"), json=True); return
+            emit("metrics", MetricsOut.paused("Recenter your body"), json=True)
+            return
 
         if mode not in trackers:
-            emit("metrics", MetricsOut.paused(f"Unknown mode '{mode}'"), json=True); return
+            emit("metrics", MetricsOut.paused(f"Unknown mode '{mode}'"), json=True)
+            return
 
         metrics, overlays, cue = trackers[mode].update(kps)
         overlays = {**(overlays or {}), "skeleton": _build_overlay_from_kps(kps)}
@@ -517,7 +525,7 @@ def on_frame(data):
         state = protocol.update(metrics, mode, kps)
         emit("protocol_state", {
             **state,
-            "reps_left": max(0, state.get("target_reps",0) - state.get("reps_done",0))
+            "reps_left": max(0, state.get("target_reps", 0) - state.get("reps_done", 0))
         })
 
         emit("metrics", MetricsOut.ok(metrics, overlays, cue), json=True)
@@ -543,6 +551,41 @@ def on_frame(data):
                     "api_index": "/api/reports",
                 }
             }, json=True)
+
+        # API cue enrichment for feedback
+        tip_text = cue
+        audio_b64 = ""
+        if cue:
+            try:
+                gem_cfg = cfg.get("services", {}).get("gemini", {})
+                if gem_cfg:
+                    gem_payload = {
+                        "model": gem_cfg.get("model", "gemini-small"),
+                        "prompt": f"{cue} Asymmetry index: {metrics.get('asymmetry_index', 0):.2f}. Give one corrective tip in simple words."
+                    }
+                    gem_headers = {"Authorization": f"Bearer {gem_cfg.get('key')}"}
+                    logger.debug(f"Calling Gemini API: URL={gem_cfg.get('url')} with payload={gem_payload}")
+                    gem_resp = requests.post(gem_cfg.get("url"), json=gem_payload, headers=gem_headers, timeout=6)
+                    logger.debug(f"Gemini API response: status={gem_resp.status_code}, body={gem_resp.text}")
+                    tip_text = gem_resp.json().get("choices", [{}])[0].get("text", cue)
+
+                eleven_cfg = cfg.get("services", {}).get("elevenlabs", {})
+                if eleven_cfg and tip_text:
+                    tts_payload = {"text": tip_text}
+                    tts_headers = {
+                        "xi-api-key": eleven_cfg.get("key"),
+                        "Content-Type": "application/json"
+                    }
+                    logger.debug(f"Calling ElevenLabs API: URL={eleven_cfg.get('url')} with payload={tts_payload}")
+                    tts_resp = requests.post(eleven_cfg.get("url"), json=tts_payload, headers=tts_headers, timeout=8)
+                    logger.debug(f"ElevenLabs API response: status={tts_resp.status_code}, body_len={len(tts_resp.content)}")
+                    if tts_resp.status_code == 200:
+                        audio_b64 = base64.b64encode(tts_resp.content).decode()
+            except Exception as e:
+                logger.error(f"AI/Voice feedback error: {e}")
+
+        if audio_b64:
+            socketio.emit("audio_cue", {"audio": audio_b64})
 
     except Exception as e:
         traceback.print_exc()
@@ -679,6 +722,7 @@ Avoid technical jargon unless needed for clarity.
         "filename": filename,
         "ai_report": ai_text,
     })
+
 
 
 # --------------------- Main ---------------------
