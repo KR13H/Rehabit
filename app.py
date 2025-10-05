@@ -1,29 +1,17 @@
 # app.py
 from __future__ import annotations
 
-import os, base64, time, math, traceback
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-import json
-from datetime import datetime
-
-import cv2, numpy as np, yaml
-from dotenv import load_dotenv
-load_dotenv()
-
-import os, base64, time, math, traceback, requests
+import os, base64, time, math, traceback, uuid, json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2, numpy as np, yaml
-from flask import Flask, render_template
+from flask import Flask, render_template, send_from_directory, jsonify
 from flask_socketio import SocketIO, emit
 
 # ---- local modules you already have ----
 from pose_backend.mediapipe_engine import PoseEngine
-from pose_backend.schemas import MetricsOut
 from pose_backend.schemas import MetricsOut
 from pose_backend.utils import valid_keypoints
 from trackers.arms import ArmsTracker
@@ -31,7 +19,7 @@ from trackers.sit_to_stand import SitStandTracker
 from trackers.march import MarchTracker
 from services.session_store import SessionStore
 
-# --------------------- Config ---------------------
+# --------------------- Paths & Config ---------------------
 ROOT = Path(__file__).parent.resolve()
 cfg_path = ROOT / "config" / "settings.yaml"
 cfg = yaml.safe_load(open(cfg_path, "r", encoding="utf-8")) if cfg_path.exists() else {}
@@ -52,16 +40,59 @@ app = Flask(
 app.config["SECRET_KEY"] = os.getenv("SECRET_KEY") or os.urandom(24).hex()
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# --------------------- Engines/Trackers ---------------------
-def resolve_env_vars(config_services):
-    for service in config_services.values():
-        for field in ["key", "url"]:
-            if field in service and service[field].isupper():
-                # Looks up variable from .env/environment
-                service[field] = os.getenv(service[field], "")
-resolve_env_vars(cfg["services"])
+# --------------------- Report Storage (JSON) ---------------------
+REPORTS_DIR = ROOT / "reports"
+REPORTS_DIR.mkdir(exist_ok=True)
 
-# ------------ Engines/Trackers -------------
+def _report_filename(session_id: str, started_at: float) -> str:
+    ts = int(started_at or time.time())
+    return f"{ts}_{session_id}.json"
+
+def save_session_report(payload: Dict[str, Any]) -> str:
+    """Persist a full JSON report and return its filepath."""
+    sid = payload.get("session_id") or uuid.uuid4().hex[:10]
+    payload["session_id"] = sid
+    fname = _report_filename(sid, payload.get("started_at", time.time()))
+    fpath = REPORTS_DIR / fname
+    with open(fpath, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return str(fpath)
+
+@app.get("/api/reports")
+def api_list_reports():
+    items = []
+    for name in sorted(os.listdir(REPORTS_DIR)):
+        if not name.endswith(".json"):
+            continue
+        p = REPORTS_DIR / name
+        try:
+            st = p.stat()
+            items.append({
+                "filename": name,
+                "size_bytes": st.st_size,
+                "modified_ts": int(st.st_mtime),
+                "download_url": f"/reports/{name}",
+            })
+        except OSError:
+            pass
+    return jsonify({"count": len(items), "items": items})
+
+@app.get("/reports/<path:fname>")
+def api_download_report(fname):
+    return send_from_directory(str(REPORTS_DIR), fname, mimetype="application/json", as_attachment=False)
+
+# --------------------- Engines/Trackers ---------------------
+def resolve_env_vars(config: Dict[str, Any]):
+    if not config or "services" not in config:
+        return
+    for service in config["services"].values():
+        for field in ("key", "url"):
+            val = service.get(field)
+            if isinstance(val, str) and val.isupper():
+                service[field] = os.getenv(val, service[field])
+
+resolve_env_vars(cfg)
+
 pose_engine = PoseEngine(cfg)
 trackers = {
     "arms":  ArmsTracker(cfg),
@@ -69,6 +100,13 @@ trackers = {
     "march": MarchTracker(cfg),
 }
 session_store = SessionStore(persist_dir=str(ROOT / ".sessions"))
+
+# Track the live session metadata for saving report
+session_meta: Dict[str, Any] = {
+    "session_id": None,
+    "started_at": None,
+    "telemetry": [],   # optional: you can append per-step snapshots if you want
+}
 
 # ===================== REP-BASED Protocol =====================
 
@@ -155,9 +193,6 @@ class RepProtocol:
 
     # ------------ Public update ------------
     def update(self, metrics: Dict[str, Any], current_mode: str, kps: Dict[str, Tuple[float,float,float,float]]) -> Dict[str, Any]:
-        """Update with latest metrics + raw keypoints.
-        Gating: only count reps if the expected mode is active.
-        """
         if not self.active:
             return self.state()
 
@@ -173,7 +208,6 @@ class RepProtocol:
         elif step.name.startswith("Elbow Flexion"):
             self._rep_elbow_flex(step, metrics, now, in_cd)
         elif step.name.startswith("Sit ↔ Stand"):
-            # NEW: robust, viewpoint-invariant sit/stand using normalized hip height + knee fallback
             self._rep_sit_stand_robust(step, metrics, kps, now, in_cd)
         elif step.name.startswith("March"):
             self._rep_march(step, metrics, now, in_cd)
@@ -246,19 +280,11 @@ class RepProtocol:
             self.phase = "down"; self.cur_peak = {}
             self.rep_cooldown_t = now; self.last_change_t = now
 
-    # ---------- NEW robust Sit↔Stand ----------
+    # ---------- Robust Sit↔Stand ----------
     def _rep_sit_stand_robust(
         self, step: Step, m: Dict[str, Any],
         kps: Dict[str, Tuple[float,float,float,float]], now: float, in_cd: bool
     ):
-        """
-        Viewpoint-invariant detection:
-        - Primary signal: normalized hip height nhip = (hip_y - shoulder_y) / (ankle_y - shoulder_y).
-          Standing -> hips higher (nhip smaller, ~0.45–0.62). Sitting -> hips lower (nhip bigger, ~0.74–0.95).
-        - Fallback: knee angles (standing >=168°, sitting <=140°).
-        - Uses EMA smoothing + hysteresis + hold times.
-        Works even if user is side-on or chair is off-center.
-        """
         def pick(names):
             pts = []
             for nm in names:
@@ -271,48 +297,40 @@ class RepProtocol:
             xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
             return (sum(xs)/len(xs), sum(ys)/len(ys))
 
-        # Key anchors (use any visible side)
         sh = pick(["left_shoulder","right_shoulder"])
         hip = pick(["left_hip","right_hip"])
         ank = pick(["left_ankle","right_ankle","left_heel","right_heel"])
         if not (sh and hip and ank):
-            # fallback entirely to knee angles if hips/shoulders/ankles not all visible
             Lk = m.get("L_knee_deg"); Rk = m.get("R_knee_deg")
             if not self._ok(Lk) or not self._ok(Rk): return
             standing = (Lk >= 168 and Rk >= 168)
             sitting  = (Lk <= 140 and Rk <= 140)
         else:
-            xS,yS = sh; xH,yH = hip; xA,yA = ank
-            # protect against degenerate division
+            _,yS = sh; _,yH = hip; _,yA = ank
             denom = (yA - yS)
             if abs(denom) < 1e-3: return
-            nhip_raw = (yH - yS) / denom  # normalized 0..1 from shoulders->ankles (image y increases downward)
+            nhip_raw = (yH - yS) / denom
             self.ema_nhip = self._ema(self.ema_nhip, float(nhip_raw), alpha=0.25)
             nhip = self.ema_nhip
 
-            # knee smoothing too (optional)
             Lk = m.get("L_knee_deg"); Rk = m.get("R_knee_deg")
             if self._ok(Lk): self.ema_Lk = self._ema(self.ema_Lk, float(Lk))
             if self._ok(Rk): self.ema_Rk = self._ema(self.ema_Rk, float(Rk))
             Lk_s = self.ema_Lk if self.ema_Lk is not None else Lk
             Rk_s = self.ema_Rk if self.ema_Rk is not None else Rk
 
-            # Hysteresis thresholds (tuneable)
-            STAND_MAX = 0.62   # nhip <= this => standing
-            SIT_MIN   = 0.74   # nhip >= this => sitting
+            STAND_MAX = 0.62
+            SIT_MIN   = 0.74
 
             standing_sig = (nhip is not None) and (nhip <= STAND_MAX)
             sitting_sig  = (nhip is not None) and (nhip >= SIT_MIN)
 
-            # Knee confirmation (if available) to increase robustness
             knee_stand = (self._ok(Lk_s) and self._ok(Rk_s) and Lk_s >= 165 and Rk_s >= 165)
             knee_sit   = (self._ok(Lk_s) and self._ok(Rk_s) and Lk_s <= 145 and Rk_s <= 145)
 
-            # Final state using OR with knee confirmation (any one strong signal is enough)
             standing = bool(standing_sig or knee_stand)
             sitting  = bool(sitting_sig  or knee_sit)
 
-        # Phase machine: sit -> stand -> sit
         if self.phase in ("idle","sit","down"):
             if sitting:
                 self.phase = "sit"
@@ -320,7 +338,6 @@ class RepProtocol:
                 self.phase = "stand"; self.last_change_t = now
 
         elif self.phase == "stand":
-            # require proper return to sit with tempo + cooldown
             if sitting and (not in_cd) and self._enforce_tempo(now, self.min_down_time):
                 rec = {
                     "trunk_lean_avg_deg": float(m.get("trunk_lean_deg") or 0.0),
@@ -400,7 +417,7 @@ class RepProtocol:
             "recommendations": recs,
         }
 
-# Steps & thresholds (unchanged)
+# Steps & thresholds
 PROTOCOL_STEPS: List[Step] = [
     Step("Arm Raise (3 slow reps)",     "arms", 3, th={"shoulder_up": 110.0, "shoulder_down": 70.0},  hint="Raise both arms slowly to head height. 3 reps."),
     Step("Elbow Flexion (3 slow reps)", "arms", 3, th={"elbow_bent": 70.0, "elbow_straight": 150.0},   hint="Bend and straighten both elbows. 3 reps."),
@@ -409,7 +426,7 @@ PROTOCOL_STEPS: List[Step] = [
 ]
 protocol = RepProtocol(PROTOCOL_STEPS)
 
-# --------------------- Overlays ---------------------
+# --------------------- Overlay builder ---------------------
 def _build_overlay_from_kps(kps: dict) -> dict:
     pts, names = [], [
         "left_shoulder","right_shoulder","left_elbow","right_elbow",
@@ -439,11 +456,36 @@ def index():
 # --------------------- Socket events ---------------------
 @socketio.on("start_protocol")
 def start_protocol(_):
-    emit("protocol_state", protocol.start())
+    # reset protocol & create new session id
+    state = protocol.start()
+    session_meta["session_id"] = uuid.uuid4().hex[:10]
+    session_meta["started_at"] = protocol.started_at
+    session_meta["telemetry"] = []  # reset optional per-frame/per-step store
+    emit("protocol_state", state)
 
 @socketio.on("stop_protocol")
 def stop_protocol(_):
-    emit("final_report", protocol.stop())
+    # Stop, save, emit final with storage
+    state = protocol.stop()
+    report = state.get("report") or protocol.report()
+    payload = {
+        "session_id": session_meta.get("session_id") or uuid.uuid4().hex[:10],
+        "started_at": session_meta.get("started_at") or protocol.started_at or time.time(),
+        "ended_at": time.time(),
+        "protocol_report": report,
+        "telemetry": session_meta.get("telemetry", []),
+        "app_version": "rehabit-0.1.0",
+    }
+    fpath = save_session_report(payload)
+    fname = os.path.basename(fpath)
+    emit("final_report", {
+        "report": report,
+        "storage": {
+            "filename": fname,
+            "download_url": f"/reports/{fname}",
+            "api_index": "/api/reports",
+        }
+    }, json=True)
 
 @socketio.on("frame")
 def on_frame(data):
@@ -468,7 +510,9 @@ def on_frame(data):
         metrics, overlays, cue = trackers[mode].update(kps)
         overlays = {**(overlays or {}), "skeleton": _build_overlay_from_kps(kps)}
 
-        # >>> Pass BOTH metrics and raw keypoints for robust sit/stand <<<
+        # Optional: capture light-weight telemetry samples (per exercise step)
+        # session_meta["telemetry"].append({"t": time.time(), "mode": mode, "m": metrics})
+
         state = protocol.update(metrics, mode, kps)
         emit("protocol_state", {
             **state,
@@ -477,8 +521,27 @@ def on_frame(data):
 
         emit("metrics", MetricsOut.ok(metrics, overlays, cue), json=True)
 
+        # If protocol finished here, save & emit final with storage
         if state.get("done"):
-            emit("final_report", state)
+            report = state.get("report") or protocol.report()
+            payload = {
+                "session_id": session_meta.get("session_id") or uuid.uuid4().hex[:10],
+                "started_at": session_meta.get("started_at") or protocol.started_at or time.time(),
+                "ended_at": time.time(),
+                "protocol_report": report,
+                "telemetry": session_meta.get("telemetry", []),
+                "app_version": "rehabit-0.1.0",
+            }
+            fpath = save_session_report(payload)
+            fname = os.path.basename(fpath)
+            emit("final_report", {
+                "report": report,
+                "storage": {
+                    "filename": fname,
+                    "download_url": f"/reports/{fname}",
+                    "api_index": "/api/reports",
+                }
+            }, json=True)
 
     except Exception as e:
         traceback.print_exc()
