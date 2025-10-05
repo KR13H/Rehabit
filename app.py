@@ -10,6 +10,8 @@ import cv2, numpy as np, yaml
 from flask import Flask, render_template, send_from_directory, jsonify
 from flask_socketio import SocketIO, emit
 
+
+# ---- local modules you already have ----
 # local imports
 from pose_backend.mediapipe_engine import PoseEngine
 from pose_backend.schemas import MetricsOut
@@ -592,8 +594,141 @@ def on_frame(data):
 @socketio.on("frame_ping")
 def frame_ping(_):
     emit("pong", {"ok": True})
+# ===================== Gemini Integration =====================
+import requests, re, logging, json, os
+from dotenv import load_dotenv
+from typing import Any, Dict, Optional
+
+load_dotenv()
+logger = logging.getLogger(__name__)
+
+def resolve_env_vars(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively resolve ${VAR} or uppercase env placeholders (like GEMINI_API_KEY)."""
+    def _resolve(value):
+        if isinstance(value, dict):
+            return {k: _resolve(v) for k, v in value.items()}
+        elif isinstance(value, list):
+            return [_resolve(v) for v in value]
+        elif isinstance(value, str):
+            matches = re.findall(r"\${(\w+)}", value)
+            if matches:
+                for var in matches:
+                    env_val = os.getenv(var)
+                    if env_val:
+                        value = value.replace(f"${{{var}}}", env_val)
+            elif value.isupper():
+                env_val = os.getenv(value)
+                if env_val:
+                    value = env_val
+            return value
+        else:
+            return value
+    return _resolve(config)
+
+# Re-resolve any env placeholders in YAML config
+cfg = resolve_env_vars(cfg)
+
+def call_gemini_api(prompt: str) -> Optional[str]:
+    """Send a text prompt to Gemini and return AI feedback."""
+    try:
+        gem_cfg = cfg.get("services", {}).get("gemini", {})
+        gem_url = (gem_cfg.get("url") or os.getenv("GEMINI_API_URL", "")).strip()
+        gem_key = (gem_cfg.get("key") or os.getenv("GEMINI_API_KEY", "")).strip()
+
+        # Use Gemini 2.0 Flash endpoint explicitly (works with your verified curl)
+        if not gem_url:
+            gem_url = "https://generativelanguage.googleapis.com"
+        if not gem_url.endswith(":generateContent"):
+            gem_url = gem_url.rstrip("/") + "/v1beta/models/gemini-2.0-flash:generateContent"
+
+        if not gem_key:
+            logger.error("Gemini API misconfigured: missing API key")
+            return None
+
+        headers = {
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": gem_key,
+        }
+
+        payload = {"contents": [{"parts": [{"text": prompt}]}]}
+
+        logger.info(f"Calling Gemini API at {gem_url}")
+        resp = requests.post(gem_url, json=payload, headers=headers, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+
+        msg = (
+            data.get("candidates", [{}])[0]
+            .get("content", {})
+            .get("parts", [{}])[0]
+            .get("text", "")
+        )
+        return msg.strip() if isinstance(msg, str) else json.dumps(msg)
+    except Exception as e:
+        logger.error(f"Gemini API request failed: {e}")
+        return None
+
+
+# --------------------- Gemini AI Report Endpoint ---------------------
+@app.get("/api/reports/ai/<filename>")
+def api_generate_gemini_report(filename):
+    fpath = REPORTS_DIR / filename
+    if not fpath.exists() or not filename.endswith(".json"):
+        return jsonify({"error": "Report not found"}), 404
+
+    try:
+        with open(fpath, "r", encoding="utf-8") as f:
+            file_json = json.load(f)
+    except Exception as e:
+        logger.error(f"Error reading report file: {e}")
+        return jsonify({"error": "Cannot read file"}), 400
+
+    prompt = f"""
+    You are an experienced and friendly physical therapist AI named Rehabit.
+    You are reviewing a JSON report from a patient’s physical exercise session.
+
+    The JSON below contains data for multiple exercises and repetitions.
+    Each repetition includes joint angles, asymmetry values, trunk lean degrees, and other biomechanical metrics.
+
+    Your job is to analyze this report in detail and produce a clear, motivating summary for the user.
+
+    Here’s the JSON report:
+    {json.dumps(file_json, indent=2)}
+
+Please include the following in your response:
+
+1. Session Overview – Summarize everything from 1st repition to last exericise and repition.
+2. Per-Exercise Breakdown– For each exercise (e.g. Arm Raise, Elbow Flexion, Sit↔Stand, March):
+   - Describe what the exercise measures.
+   - Mention how many reps were completed.
+   - Summarize consistency, control, and smoothness across repetitions with numbers from json.
+   - Note any imbalances between left and right sides.
+3. Imbalance & Form Observations– Identify asymmetries, trunk lean, or uneven motion with numbers and how to improve.
+4. Strengths / Improvements–
+   - Mention what the user did well.
+   - Provide gentle, specific advice on what to improve next time.
+5. Actionable Recommendations– Short, motivational takeaways or drills the user can try next session.
+
+Your tone should be warm, encouraging, and professional — like a supportive physiotherapist.
+Write your feedback as a proffessional but friendly human would, give me data to anayaze in number format and paragraphs. not overly friendly, but able to be understood by any user of any age. 
+Avoid technical jargon unless needed for clarity.
+"""
+
+    ai_text = call_gemini_api(prompt)
+    if not ai_text:
+        return jsonify({"error": "Gemini AI failed to respond"}), 503
+
+    return jsonify({
+        "filename": filename,
+        "ai_report": ai_text,
+    })
+
 
 
 # --------------------- Main ---------------------
 if __name__ == "__main__":
+    import absl.logging
+    absl.logging.set_verbosity(absl.logging.ERROR)  # suppress TensorFlow/MediaPipe logs
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+    os.environ["MEDIAPIPE_DISABLE_GPU"] = "1"
     socketio.run(app, host=cfg["server"]["host"], port=cfg["server"]["port"])
