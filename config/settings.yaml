@@ -17,9 +17,9 @@ server:
 
 services:
   gemini:
-    url: GEMINI_API_URL
-    key: GEMINI_API_KEY
-    model: "gemini-small"
+    url: "${GEMINI_API_URL}"
+    key: "${GEMINI_API_KEY}"
+  
   elevenlabs:
-    url: ELEVENLABS_API_URL
-    key: ELEVENLABS_API_KEY
+    url: "${ELEVENLABS_API_URL}"
+    key: "${ELEVENLABS_API_KEY}"

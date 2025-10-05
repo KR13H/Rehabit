@@ -98,6 +98,44 @@
         -webkit-text-fill-color:transparent;
         background-clip:text;
       }
+      .ai-box{
+        margin-top:12px;
+        border:1px solid var(--border);
+        border-radius:12px;
+        background:rgba(30,35,55,.7);
+        padding:14px 16px;
+        box-shadow:0 6px 18px rgba(0,0,0,.22);
+      }
+      .ai-title{
+        font-weight:800;
+        font-size:14px;
+        letter-spacing:.3px;
+        color:#c7d2fe;
+        margin-bottom:8px;
+        text-transform:uppercase;
+      }
+      .ai-body{
+        font-size:14px;
+        color:var(--text);
+        line-height:1.7;
+        white-space:pre-wrap;
+      }
+      .ai-links{
+        margin-top:8px;
+        font-size:12px;
+        color:var(--muted);
+        display:flex;
+        align-items:center;
+        gap:8px;
+      }
+      .ai-links a{
+        color:#a5b4fc;
+        text-decoration:none;
+      }
+      .ai-links a:hover{
+        text-decoration:underline;
+      }
+      
       
   </style>
 </head>
@@ -150,6 +188,15 @@
     <span>Overall Score</span>
     <strong id="scoreValue">0</strong>
   </div>
+  <div class="ai-box" id="aiBox">
+    <div class="ai-title">AI Coach Feedback</div>
+    <div class="ai-body" id="aiContent">Finish the session to see your personalized feedback…</div>
+    <div class="ai-links" id="aiLinks" style="display:none;">
+      <a id="jsonLink" href="#" target="_blank">View session JSON</a>
+      <span aria-hidden="true">•</span>
+      <a href="/api/reports" target="_blank">All reports</a>
+    </div>
+  </div>
 
   <!-- How-to overlay -->
   <div class="intro" id="introOverlay">
@@ -188,6 +235,10 @@ const ui = {
   progress: document.getElementById('progressBar'),
   stepAnim: document.getElementById('stepAnim'),
   metrics: document.getElementById('metricsBox'),
+  aiBox: document.getElementById('aiBox'),
+  aiContent: document.getElementById('aiContent'),
+  aiLinks: document.getElementById('aiLinks'),
+  jsonLink: document.getElementById('jsonLink'),
   intro: {
     el: document.getElementById('introOverlay'),
     title: document.getElementById('introTitle'),
@@ -471,25 +522,55 @@ socket.on('protocol_state',(s)=>{
 });
 
 // REPLACE your existing socket.on('final_report', ...) with this:
-socket.on('final_report', (rep) => {
-    stopSending();
-    stopCam();
-    ui.btnStart.disabled = false;
-    ui.btnStop.disabled  = true;
-    ui.cue.textContent   = "Session complete.";
+socket.on('final_report', (rep)=>{
+    // stop streaming/camera
+    stopSending(); 
+    stopCam(); 
+    ui.btnStart.disabled = false; 
+    ui.btnStop.disabled = true;
   
-    // Pull score from payload (supports both shapes)
-    const score = rep?.report?.overall_score ?? rep?.overall_score ?? '—';
+    // Show overall score on-screen (if you already show it elsewhere, keep both)
+    const score = rep?.report?.overall_score;
+    if (typeof score === 'number') {
+      ui.cue.textContent = `Session complete — Overall Score: ${score}`;
+    } else {
+      ui.cue.textContent = "Session complete.";
+    }
   
-    // Show in banner and reveal it
-    document.getElementById('scoreValue').textContent = score;
-    document.getElementById('scoreBanner').style.display = 'flex';
+    // ---- NEW: kick off Gemini analysis and show it in the AI panel ----
+    ui.aiContent.textContent = "Analyzing your session with AI…";
+    ui.aiLinks.style.display = "none";
   
-    // (optional) also show the full JSON in your metrics panel
-    if (rep?.report) {
-      ui.metrics.textContent = JSON.stringify(rep.report, null, 2);
+    const fname = rep?.storage?.filename;
+    const dl = rep?.storage?.download_url; // e.g., /reports/<file>.json
+  
+    // If we have a saved JSON file, show links and call the AI endpoint
+    if (fname && dl) {
+      // show JSON link
+      ui.jsonLink.href = dl;
+      ui.aiLinks.style.display = "flex";
+  
+      // fetch Gemini analysis
+      fetch(`/api/reports/ai/${encodeURIComponent(fname)}`)
+        .then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
+        .then(j => {
+          if (j && j.ai_report) {
+            ui.aiContent.textContent = j.ai_report;
+          } else if (j && j.error) {
+            ui.aiContent.textContent = `AI analysis unavailable: ${j.error}`;
+          } else {
+            ui.aiContent.textContent = "AI analysis unavailable.";
+          }
+        })
+        .catch(err => {
+          ui.aiContent.textContent = `AI analysis failed: ${err.message}`;
+        });
+    } else {
+      // Fallback if the backend didn't include a saved report (shouldn't happen)
+      ui.aiContent.textContent = "Session summary saved, but AI analysis could not be started.";
     }
   });
+  
   
 
 /* ======= Controls ======= */
