@@ -77,3 +77,12 @@ Each exercise includes posture detection, form validation, and AI-generated audi
    ```bash
    git clone https://github.com/<your-username>/Rehabit.git
    cd Rehabit
+2. Intall dependencies 
+   ```bash
+   pip install -r requirements.txt
+3. Run the Flask server
+   ```bash
+   python app.py
+4. Open the app in your browser
+   ```bash
+   Visit-> http://127.0.0.1:8000
