@@ -71,18 +71,21 @@ Each exercise includes posture detection, form validation, and AI-generated audi
 
 ---
 
-## Installation and Setup
+## Quickstart (macOS/Linux — bash)
 
-1. Clone the repository  
-   ```bash
-   git clone https://github.com/<your-username>/Rehabit.git
-   cd Rehabit
-2. Intall dependencies 
-   ```bash
-   pip install -r requirements.txt
-3. Run the Flask server
-   ```bash
-   python app.py
-4. Open the app in your browser
-   ```bash
-   Visit-> http://127.0.0.1:8000
+```bash
+# 1) Clone
+git clone https://github.com/KR13H/Rehabit.git
+
+# 2) Virtual env + pip
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+
+# 3) Install deps
+pip install -r requirements.txt
+
+
+# 5) Run
+python app.py
+
